@@ -1,23 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
-  "helix-core",
-  "helix-view",
-  "helix-term",
-  "helix-tui",
-  "helix-lsp-types",
-  "helix-lsp",
-  "helix-event",
-  "helix-dap",
-  "helix-loader",
-  "helix-vcs",
-  "helix-parsec",
-  "helix-stdx",
-  "xtask",
+  "crates/helix-core",
+  "crates/helix-view",
+  "crates/helix-term",
+  "crates/helix-tui",
+  "crates/helix-lsp-types",
+  "crates/helix-lsp",
+  "crates/helix-event",
+  "crates/helix-dap",
+  "crates/helix-loader",
+  "crates/helix-vcs",
+  "crates/helix-parsec",
+  "crates/helix-stdx",
+  "tools/xtask",
 ]
 
 default-members = [
-  "helix-term"
+  "crates/helix-term"
 ]
 
 [profile.release]

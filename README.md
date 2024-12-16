@@ -2,9 +2,9 @@
 
 <h1>
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="logo_dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="logo_light.svg">
-  <img alt="Helix" height="128" src="logo_light.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/pictures/logo_dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/pictures/logo_light.svg">
+  <img alt="Helix" height="128" src="docs/pictures/logo_light.svg">
 </picture>
 </h1>
 
@@ -16,7 +16,7 @@
 
 </div>
 
-![Screenshot](./screenshot.png)
+![Screenshot](./docs/pictures/screenshot.png)
 
 A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.
 
