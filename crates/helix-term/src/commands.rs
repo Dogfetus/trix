@@ -676,6 +676,10 @@ impl PartialEq for MappableCommand {
     }
 }
 
+fn current_file_path(cx: &Context) -> Option<PathBuf> {
+    doc!(cx.editor).path().cloned()
+}
+
 fn no_op(_cx: &mut Context) {}
 
 type MoveFn =
@@ -864,35 +868,37 @@ fn goto_line_start(cx: &mut Context) {
 
 fn goto_next_buffer(cx: &mut Context) {
     goto_buffer(cx.editor, Direction::Forward, cx.count());
+    update_file_tree(cx);
 }
 
 fn goto_previous_buffer(cx: &mut Context) {
     goto_buffer(cx.editor, Direction::Backward, cx.count());
+    update_file_tree(cx);
 }
 
-fn goto_buffer(editor: &mut Editor, direction: Direction, count: usize) {
+fn goto_buffer(editor: &mut Editor, direction: Direction, count: usize) -> Option<DocumentId> {
     let current = view!(editor).doc;
 
     let id = match direction {
         Direction::Forward => {
             let iter = editor.documents.keys();
-            // skip 'count' times past current buffer
             iter.cycle().skip_while(|id| *id != &current).nth(count)
         }
         Direction::Backward => {
             let iter = editor.documents.keys();
-            // skip 'count' times past current buffer
             iter.rev()
                 .cycle()
                 .skip_while(|id| *id != &current)
                 .nth(count)
         }
+    };
+
+    if let Some(&id) = id {
+        editor.switch(id, Action::Replace);
+        Some(id)
+    } else {
+        None
     }
-    .unwrap();
-
-    let id = *id;
-
-    editor.switch(id, Action::Replace);
 }
 
 fn extend_to_line_start(cx: &mut Context) {
@@ -2943,6 +2949,7 @@ fn file_picker(cx: &mut Context) {
     }
     let picker = ui::file_picker(root, &cx.editor.config());
     cx.push_layer(Box::new(overlaid(picker)));
+    update_file_tree(cx);
 }
 
 fn file_picker_in_current_buffer_directory(cx: &mut Context) {
@@ -2960,6 +2967,7 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
 
     let picker = ui::file_picker(path, &cx.editor.config());
     cx.push_layer(Box::new(overlaid(picker)));
+    update_file_tree(cx);
 }
 
 fn file_picker_in_current_directory(cx: &mut Context) {
@@ -2971,6 +2979,7 @@ fn file_picker_in_current_directory(cx: &mut Context) {
     }
     let picker = ui::file_picker(cwd, &cx.editor.config());
     cx.push_layer(Box::new(overlaid(picker)));
+    update_file_tree(cx);
 }
 
 fn buffer_picker(cx: &mut Context) {
@@ -3039,6 +3048,7 @@ fn buffer_picker(cx: &mut Context) {
         Some((meta.id.into(), Some((line, line))))
     });
     cx.push_layer(Box::new(overlaid(picker)));
+    update_file_tree(cx);
 }
 
 fn jumplist_picker(cx: &mut Context) {
@@ -3130,6 +3140,7 @@ fn jumplist_picker(cx: &mut Context) {
         Some((meta.id.into(), Some((line, line))))
     });
     cx.push_layer(Box::new(overlaid(picker)));
+    update_file_tree(cx);
 }
 
 fn changed_file_picker(cx: &mut Context) {
@@ -3224,6 +3235,7 @@ fn changed_file_picker(cx: &mut Context) {
             }
         });
     cx.push_layer(Box::new(overlaid(picker)));
+    update_file_tree(cx);
 }
 
 // fn toggle_explorer(cx: &mut Context) {
@@ -3279,6 +3291,14 @@ fn open_file_tree(cx: &mut Context) {
     ));
 }
 
+fn update_file_tree(cx: &mut Context) {
+    if let Some(path) = current_file_path(cx) {
+        reveal_file_in_file_tree(cx, Some(path));
+    } else {
+        cx.editor.set_error("Current file has no path.");
+    }
+}
+
 fn reveal_file_in_file_tree(cx: &mut Context, path: Option<PathBuf>) {
     cx.callback.push(Box::new(
         |compositor: &mut Compositor, cx: &mut compositor::Context| {
@@ -3306,7 +3326,18 @@ fn toggle_file_tree(cx: &mut Context) {
     reveal_file_in_file_tree(cx, None)
 }
 
-fn close_file_tree(_cx: &mut Context) {}
+fn close_file_tree(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, _cx: &mut compositor::Context| {
+            if let Some(editor) = compositor.find::<ui::EditorView>() {
+                // Check if the explorer exists and clear it
+                if editor.explorer.is_some() {
+                    editor.explorer = None;
+                }
+            }
+        },
+    ));
+}
 
 pub fn command_palette(cx: &mut Context) {
     let register = cx.register;
@@ -5362,6 +5393,7 @@ fn jump_forward(cx: &mut Context) {
         doc.ensure_view_init(view.id);
         view.ensure_cursor_in_view_center(doc, config.scrolloff);
     };
+    update_file_tree(cx);
 }
 
 fn jump_backward(cx: &mut Context) {
@@ -5384,6 +5416,7 @@ fn jump_backward(cx: &mut Context) {
         doc.ensure_view_init(view.id);
         view.ensure_cursor_in_view_center(doc, config.scrolloff);
     };
+    update_file_tree(cx);
 }
 
 fn save_selection(cx: &mut Context) {

@@ -1067,12 +1067,12 @@ impl<T: TreeViewItem + Clone> TreeView<T> {
                 key!(i @ '0'..='9') => {
                     self.count = i.to_digit(10).unwrap_or(0) as usize + count * 10
                 }
-                shift!('J') => self.move_to_next_sibling()?,
-                shift!('K') => self.move_to_previous_sibling()?,
+                shift!('K') => self.move_to_next_sibling()?,
+                shift!('J') => self.move_to_previous_sibling()?,
                 shift!('H') => self.move_to_first_sibling()?,
                 shift!('L') => self.move_to_last_sibling()?,
-                key!('j') | key!(Down) | ctrl!('n') => self.move_down(1.max(count)),
-                key!('k') | key!(Up) | ctrl!('p') => self.move_up(1.max(count)),
+                key!('k') | key!(Down) | ctrl!('n') => self.move_down(1.max(count)),
+                key!('j') | key!(Up) | ctrl!('p') => self.move_up(1.max(count)),
                 key!('h') | key!(Left) => self.move_to_parent()?,
                 key!('l') | key!(Right) => self.move_to_children()?,
                 key!(Enter) | key!('o') => self.on_enter(cx, params, self.selected)?,
