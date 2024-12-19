@@ -20,9 +20,12 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "A-." =>  repeat_last_motion,
 
         "C-f" => { "File Explorer"
-            "o" => open_explorer,
-            "c" => close_explorer,
-            "t" => toggle_explorer,
+            // "e" => open_explorer,
+            // "r" => close_explorer,
+            // "t" => toggle_explorer,
+            "o" => open_file_tree,
+            "c" => close_file_tree,
+            "f" => toggle_file_tree,
         },
 
         "~" => switch_case,

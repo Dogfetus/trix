@@ -1,181 +1,321 @@
 use std::cmp::Ordering;
-use std::iter::Peekable;
 
 use anyhow::Result;
+use helix_view::theme::Modifier;
 
 use crate::{
-    compositor::{Context, EventResult},
-    ctrl, key, shift,
+    compositor::{Component, Context, EventResult},
+    ctrl, key, shift, ui,
 };
-use helix_core::unicode::width::UnicodeWidthStr;
+use helix_core::movement::Direction;
 use helix_view::{
     graphics::Rect,
     input::{Event, KeyEvent},
 };
-use tui::{buffer::Buffer as Surface, text::Spans};
+use tui::buffer::Buffer as Surface;
 
-pub trait TreeItem: Sized {
-    type Params;
+use super::Prompt;
 
-    fn text(&self, cx: &mut Context, selected: bool, params: &mut Self::Params) -> Spans;
-    fn is_child(&self, other: &Self) -> bool;
-    fn cmp(&self, other: &Self) -> Ordering;
+pub trait TreeViewItem: Sized + Ord {
+    type Params: Default;
 
-    fn filter(&self, cx: &mut Context, s: &str, params: &mut Self::Params) -> bool {
-        self.text(cx, false, params)
-            .0
-            .into_iter()
-            .map(|s| s.content)
-            .collect::<Vec<_>>()
-            .concat()
-            .contains(s)
+    fn name(&self) -> String;
+    fn is_parent(&self) -> bool;
+
+    fn filter(&self, s: &str) -> bool {
+        self.name().to_lowercase().contains(&s.to_lowercase())
     }
 
-    fn get_childs(&self) -> Result<Vec<Self>> {
-        Ok(vec![])
-    }
+    fn get_children(&self) -> Result<Vec<Self>>;
 }
 
-fn tree_item_cmp<T: TreeItem>(item1: &T, item2: &T) -> Ordering {
-    if item1.is_child(item2) {
-        return Ordering::Greater;
-    }
-    if item2.is_child(item1) {
-        return Ordering::Less;
-    }
-
+fn tree_item_cmp<T: TreeViewItem>(item1: &T, item2: &T) -> Ordering {
     T::cmp(item1, item2)
 }
 
-fn vec_to_tree<T: TreeItem>(mut items: Vec<T>, level: usize) -> Vec<Elem<T>> {
-    fn get_childs<T, Iter>(iter: &mut Peekable<Iter>, elem: &mut Elem<T>)
-    where
-        T: TreeItem,
-        Iter: Iterator<Item = T>,
-    {
-        let level = elem.level + 1;
-        loop {
-            if !iter.peek().map_or(false, |next| next.is_child(&elem.item)) {
-                break;
-            }
-            let mut child = Elem::new(iter.next().unwrap(), level);
-            if iter.peek().map_or(false, |nc| nc.is_child(&child.item)) {
-                get_childs(iter, &mut child);
-            }
-            elem.folded.push(child);
-        }
-    }
-
-    items.sort_by(tree_item_cmp);
-    let mut elems = Vec::with_capacity(items.len());
-    let mut iter = items.into_iter().peekable();
-    while let Some(item) = iter.next() {
-        let mut elem = Elem::new(item, level);
-        if iter.peek().map_or(false, |next| next.is_child(&elem.item)) {
-            get_childs(&mut iter, &mut elem);
-        }
-        expand_elems(&mut elems, elem);
-    }
-    elems
+fn vec_to_tree<T: TreeViewItem>(mut items: Vec<T>) -> Vec<Tree<T>> {
+    items.sort();
+    index_elems(
+        0,
+        items
+            .into_iter()
+            .map(|item| Tree::new(item, vec![]))
+            .collect(),
+    )
 }
 
-// return total elems's count contain self
-fn get_elems_recursion<T: TreeItem>(t: &mut Elem<T>, depth: usize) -> Result<usize> {
-    let mut childs = t.item.get_childs()?;
-    childs.sort_by(tree_item_cmp);
-    let mut elems = Vec::with_capacity(childs.len());
-    let level = t.level + 1;
-    let mut total = 1;
-    for child in childs {
-        let mut elem = Elem::new(child, level);
-        let count = if depth > 0 {
-            get_elems_recursion(&mut elem, depth - 1)?
-        } else {
-            1
-        };
-        elems.push(elem);
-        total += count;
-    }
-    t.folded = elems;
-    Ok(total)
-}
-
-fn expand_elems<T: TreeItem>(dist: &mut Vec<Elem<T>>, mut t: Elem<T>) {
-    let childs = std::mem::take(&mut t.folded);
-    dist.push(t);
-    for child in childs {
-        expand_elems(dist, child)
-    }
-}
-
-pub enum TreeOp<T> {
+pub enum TreeOp {
     Noop,
-    Restore,
-    InsertChild(Vec<T>),
     GetChildsAndInsert,
-    ReplaceTree(Vec<T>),
 }
 
-pub struct Elem<T> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Tree<T> {
     item: T,
-    level: usize,
-    folded: Vec<Self>,
+    parent_index: Option<usize>,
+    index: usize,
+    children: Vec<Self>,
+
+    /// Why do we need this property?
+    /// Can't we just use `!children.is_empty()`?
+    ///
+    /// Because we might have for example an open folder that is empty,
+    /// and user just added a new file under that folder,
+    /// and the user refreshes the whole tree.
+    ///
+    /// Without `open`, we will not refresh any node without children,
+    /// and thus the folder still appears empty after refreshing.
+    is_opened: bool,
 }
 
-impl<T: Clone> Clone for Elem<T> {
+impl<T: Clone> Clone for Tree<T> {
     fn clone(&self) -> Self {
         Self {
             item: self.item.clone(),
-            level: self.level,
-            folded: self.folded.clone(),
+            index: self.index,
+            children: self.children.clone(),
+            is_opened: self.is_opened,
+            parent_index: self.parent_index,
         }
     }
 }
 
-impl<T> Elem<T> {
-    pub fn new(item: T, level: usize) -> Self {
+#[derive(Clone)]
+struct TreeIter<'a, T> {
+    current_index_forward: usize,
+    current_index_reverse: isize,
+    tree: &'a Tree<T>,
+}
+
+impl<'a, T> Iterator for TreeIter<'a, T> {
+    type Item = &'a Tree<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.current_index_forward;
+        if index > self.tree.len().saturating_sub(1) {
+            None
+        } else {
+            self.current_index_forward = self.current_index_forward.saturating_add(1);
+            self.tree.get(index)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.tree.len(), Some(self.tree.len()))
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for TreeIter<'a, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let index = self.current_index_reverse;
+        if index < 0 {
+            None
+        } else {
+            self.current_index_reverse = self.current_index_reverse.saturating_sub(1);
+            self.tree.get(index as usize)
+        }
+    }
+}
+
+impl<'a, T> ExactSizeIterator for TreeIter<'a, T> {}
+
+impl<T: TreeViewItem> Tree<T> {
+    fn open(&mut self) -> Result<()> {
+        if self.item.is_parent() {
+            self.children = self.get_children()?;
+            self.is_opened = true;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.is_opened = false;
+        self.children = vec![];
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        if !self.is_opened {
+            return Ok(());
+        }
+        let latest_children = self.get_children()?;
+        let filtered = std::mem::take(&mut self.children)
+            .into_iter()
+            // Remove children that does not exists in latest_children
+            .filter(|tree| {
+                latest_children
+                    .iter()
+                    .any(|child| tree.item.name().eq(&child.item.name()))
+            })
+            .map(|mut tree| {
+                tree.refresh()?;
+                Ok(tree)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Add new children
+        let new_nodes = latest_children
+            .into_iter()
+            .filter(|child| {
+                !filtered
+                    .iter()
+                    .any(|child_| child.item.name().eq(&child_.item.name()))
+            })
+            .collect::<Vec<_>>();
+
+        self.children = filtered.into_iter().chain(new_nodes).collect();
+
+        self.sort();
+
+        self.regenerate_index();
+
+        Ok(())
+    }
+
+    fn get_children(&self) -> Result<Vec<Tree<T>>> {
+        Ok(vec_to_tree(self.item.get_children()?))
+    }
+
+    fn sort(&mut self) {
+        self.children
+            .sort_by(|a, b| tree_item_cmp(&a.item, &b.item))
+    }
+}
+
+impl<T> Tree<T> {
+    pub fn new(item: T, children: Vec<Tree<T>>) -> Self {
+        let is_opened = !children.is_empty();
         Self {
             item,
-            level,
-            folded: vec![],
+            index: 0,
+            parent_index: None,
+            children: index_elems(0, children),
+            is_opened,
+        }
+    }
+
+    fn iter(&self) -> TreeIter<T> {
+        TreeIter {
+            tree: self,
+            current_index_forward: 0,
+            current_index_reverse: (self.len() - 1) as isize,
+        }
+    }
+
+    /// Find an element in the tree with given `predicate`.
+    /// `start_index` is inclusive if direction is `Forward`.
+    /// `start_index` is exclusive if direction is `Backward`.
+    fn find<F>(&self, start_index: usize, direction: Direction, predicate: F) -> Option<usize>
+    where
+        F: Clone + FnMut(&Tree<T>) -> bool,
+    {
+        match direction {
+            Direction::Forward => match self
+                .iter()
+                .skip(start_index)
+                .position(predicate.clone())
+                .map(|index| index + start_index)
+            {
+                Some(index) => Some(index),
+                None => self.iter().position(predicate),
+            },
+
+            Direction::Backward => match self.iter().take(start_index).rposition(predicate.clone())
+            {
+                Some(index) => Some(index),
+                None => self.iter().rposition(predicate),
+            },
         }
     }
 
     pub fn item(&self) -> &T {
         &self.item
     }
+
+    fn get(&self, index: usize) -> Option<&Tree<T>> {
+        if self.index == index {
+            Some(self)
+        } else {
+            self.children.iter().find_map(|elem| elem.get(index))
+        }
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut Tree<T>> {
+        if self.index == index {
+            Some(self)
+        } else {
+            self.children
+                .iter_mut()
+                .find_map(|elem| elem.get_mut(index))
+        }
+    }
+
+    fn len(&self) -> usize {
+        (1_usize).saturating_add(self.children.iter().map(|elem| elem.len()).sum())
+    }
+
+    fn regenerate_index(&mut self) {
+        let items = std::mem::take(&mut self.children);
+        self.children = index_elems(0, items);
+    }
 }
 
-pub struct Tree<T: TreeItem> {
-    items: Vec<Elem<T>>,
-    recycle: Option<(String, Vec<Elem<T>>)>,
-    selected: usize,           // select item index
-    save_view: (usize, usize), // (selected, row)
-    winline: usize,            // view row
-    col: usize,
+#[derive(Clone, Debug)]
+struct SavedView {
+    selected: usize,
+    winline: usize,
+}
+
+pub struct TreeView<T: TreeViewItem> {
+    tree: Tree<T>,
+
+    search_prompt: Option<(Direction, Prompt)>,
+
+    search_str: String,
+
+    /// Selected item idex
+    selected: usize,
+
+    backward_jumps: Vec<usize>,
+    forward_jumps: Vec<usize>,
+
+    saved_view: Option<SavedView>,
+
+    /// For implementing vertical scroll
+    winline: usize,
+
+    /// For implementing horizontal scoll
+    column: usize,
+
+    /// For implementing horizontal scoll
     max_len: usize,
     count: usize,
     tree_symbol_style: String,
+
     #[allow(clippy::type_complexity)]
     pre_render: Option<Box<dyn Fn(&mut Self, Rect) + 'static>>,
+
     #[allow(clippy::type_complexity)]
-    on_opened_fn:
-        Option<Box<dyn FnMut(&mut T, &mut Context, &mut T::Params) -> TreeOp<T> + 'static>>,
+    on_opened_fn: Option<Box<dyn FnMut(&mut T, &mut Context, &mut T::Params) -> TreeOp + 'static>>,
+
     #[allow(clippy::type_complexity)]
     on_folded_fn: Option<Box<dyn FnMut(&mut T, &mut Context, &mut T::Params) + 'static>>,
+
     #[allow(clippy::type_complexity)]
-    on_next_key: Option<Box<dyn FnMut(&mut Context, &mut Self, KeyEvent)>>,
+    on_next_key: Option<Box<dyn FnMut(&mut Context, &mut Self, &KeyEvent) -> Result<()>>>,
 }
 
-impl<T: TreeItem> Tree<T> {
-    pub fn new(items: Vec<Elem<T>>) -> Self {
-        Self {
-            items,
-            recycle: None,
+impl<T: TreeViewItem> TreeView<T> {
+    pub fn build_tree(root: T) -> Result<Self> {
+        let children = root.get_children()?;
+        let items = vec_to_tree(children);
+        Ok(Self {
+            tree: Tree::new(root, items),
             selected: 0,
-            save_view: (0, 0),
+            backward_jumps: vec![],
+            forward_jumps: vec![],
+            saved_view: None,
             winline: 0,
-            col: 0,
+            column: 0,
             max_len: 0,
             count: 0,
             tree_symbol_style: "ui.text".into(),
@@ -183,31 +323,14 @@ impl<T: TreeItem> Tree<T> {
             on_opened_fn: None,
             on_folded_fn: None,
             on_next_key: None,
-        }
-    }
-
-    pub fn replace_with_new_items(&mut self, items: Vec<T>) {
-        let old = std::mem::replace(self, Self::new(vec_to_tree(items, 0)));
-        self.on_opened_fn = old.on_opened_fn;
-        self.on_folded_fn = old.on_folded_fn;
-        self.tree_symbol_style = old.tree_symbol_style;
-    }
-
-    pub fn build_tree(items: Vec<T>) -> Self {
-        Self::new(vec_to_tree(items, 0))
-    }
-
-    pub fn build_from_root(t: T, depth: usize) -> Result<Self> {
-        let mut elem = Elem::new(t, 0);
-        let count = get_elems_recursion(&mut elem, depth)?;
-        let mut elems = Vec::with_capacity(count);
-        expand_elems(&mut elems, elem);
-        Ok(Self::new(elems))
+            search_prompt: None,
+            search_str: "".into(),
+        })
     }
 
     pub fn with_enter_fn<F>(mut self, f: F) -> Self
     where
-        F: FnMut(&mut T, &mut Context, &mut T::Params) -> TreeOp<T> + 'static,
+        F: FnMut(&mut T, &mut Context, &mut T::Params) -> TreeOp + 'static,
     {
         self.on_opened_fn = Some(Box::new(f));
         self
@@ -226,326 +349,700 @@ impl<T: TreeItem> Tree<T> {
         self
     }
 
-    fn next_item(&self) -> Option<&Elem<T>> {
-        self.items.get(self.selected + 1)
+    /// Reveal item in the tree based on the given `segments`.
+    ///
+    /// The name of the root should be excluded.
+    ///
+    /// Example `segments`:
+    ///
+    ///    vec!["helix-term", "src", "ui", "tree.rs"]
+    ///
+    pub fn reveal_item(&mut self, segments: Vec<String>) -> Result<()> {
+        // Expand the tree
+        let root = self.tree.item.name();
+        segments.iter().fold(
+            Ok(&mut self.tree),
+            |current_tree, segment| match current_tree {
+                Err(err) => Err(err),
+                Ok(current_tree) => {
+                    match current_tree
+                        .children
+                        .iter_mut()
+                        .find(|tree| tree.item.name().eq(segment))
+                    {
+                        Some(tree) => {
+                            if !tree.is_opened {
+                                tree.open()?;
+                            }
+                            Ok(tree)
+                        }
+                        None => Err(anyhow::anyhow!(format!(
+                            "Unable to find path: '{}'. current_segment = '{segment}'. current_root = '{root}'",
+                            segments.join("/"),
+                        ))),
+                    }
+                }
+            },
+        )?;
+
+        // Locate the item
+        self.regenerate_index();
+        self.set_selected(
+            segments
+                .iter()
+                .fold(&self.tree, |tree, segment| {
+                    tree.children
+                        .iter()
+                        .find(|tree| tree.item.name().eq(segment))
+                        .expect("Should be unreachable")
+                })
+                .index,
+        );
+
+        self.align_view_center();
+        Ok(())
     }
 
-    fn next_not_descendant_pos(&self, index: usize) -> usize {
-        let item = &self.items[index];
-        self.find(index + 1, false, |n| n.level <= item.level)
-            .unwrap_or(self.items.len())
+    fn align_view_center(&mut self) {
+        self.pre_render = Some(Box::new(|tree, area| {
+            tree.winline = area.height as usize / 2
+        }))
     }
 
-    fn find_parent(&self, index: usize) -> Option<usize> {
-        let item = &self.items[index];
-        self.find(index, true, |p| p.level < item.level)
+    fn align_view_top(&mut self) {
+        self.winline = 0
     }
 
-    // rev start: start - 1
-    fn find<F>(&self, start: usize, rev: bool, f: F) -> Option<usize>
-    where
-        F: FnMut(&Elem<T>) -> bool,
-    {
-        let iter = self.items.iter();
-        if rev {
-            iter.take(start).rposition(f)
+    fn align_view_bottom(&mut self) {
+        self.pre_render = Some(Box::new(|tree, area| tree.winline = area.height as usize))
+    }
+
+    fn regenerate_index(&mut self) {
+        self.tree.regenerate_index();
+    }
+
+    fn move_to_parent(&mut self) -> Result<()> {
+        if let Some(parent) = self.current_parent()? {
+            let index = parent.index;
+            self.set_selected(index)
+        }
+        Ok(())
+    }
+
+    fn move_to_children(&mut self) -> Result<()> {
+        let current = self.current_mut()?;
+        if current.is_opened {
+            self.set_selected(self.selected + 1);
+            Ok(())
         } else {
-            iter.skip(start).position(f).map(|p| p + start)
+            current.open()?;
+            if !current.children.is_empty() {
+                self.set_selected(self.selected + 1);
+                self.regenerate_index();
+            }
+            Ok(())
+        }
+    }
+
+    pub fn refresh(&mut self) -> Result<()> {
+        self.tree.refresh()?;
+        self.set_selected(self.selected);
+        Ok(())
+    }
+
+    fn move_to_first_line(&mut self) {
+        self.move_up(usize::MAX / 2)
+    }
+
+    fn move_to_last_line(&mut self) {
+        self.move_down(usize::MAX / 2)
+    }
+
+    fn move_leftmost(&mut self) {
+        self.move_left(usize::MAX / 2);
+    }
+
+    fn move_rightmost(&mut self) {
+        self.move_right(usize::MAX / 2)
+    }
+
+    fn restore_saved_view(&mut self) -> Result<()> {
+        if let Some(saved_view) = self.saved_view.take() {
+            self.selected = saved_view.selected;
+            self.winline = saved_view.winline;
+            self.refresh()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn prompt(&self) -> Option<&Prompt> {
+        if let Some((_, prompt)) = self.search_prompt.as_ref() {
+            Some(prompt)
+        } else {
+            None
         }
     }
 }
 
-impl<T: TreeItem> Tree<T> {
-    pub fn on_enter(&mut self, cx: &mut Context, params: &mut T::Params) {
-        if self.items.is_empty() {
-            return;
-        }
-        if let Some(next_level) = self.next_item().map(|elem| elem.level) {
-            let current = &mut self.items[self.selected];
-            let current_level = current.level;
-            if next_level > current_level {
-                if let Some(mut on_folded_fn) = self.on_folded_fn.take() {
-                    on_folded_fn(&mut current.item, cx, params);
-                    self.on_folded_fn = Some(on_folded_fn);
-                }
-                self.fold_current_child();
-                return;
-            }
+pub fn tree_view_help() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("o, Enter", "Open/Close"),
+        ("j, down, C-n", "Down"),
+        ("k, up, C-p", "Up"),
+        ("h, left", "Go to parent"),
+        ("l, right", "Expand"),
+        ("J", "Go to next sibling"),
+        ("K", "Go to previous sibling"),
+        ("H", "Go to first child"),
+        ("L", "Go to last child"),
+        ("R", "Refresh"),
+        ("/", "Search"),
+        ("n", "Go to next search match"),
+        ("N", "Go to previous search match"),
+        ("gh, Home", "Scroll to the leftmost"),
+        ("gl, End", "Scroll to the rightmost"),
+        ("C-o", "Jump backward"),
+        ("C-i, Tab", "Jump forward"),
+        ("C-d", "Half page down"),
+        ("C-u", "Half page up"),
+        ("PageDown", "Full page down"),
+        ("PageUp", "Full page up"),
+        ("zt", "Align view top"),
+        ("zz", "Align view center"),
+        ("zb", "Align view bottom"),
+        ("gg", "Go to first line"),
+        ("ge", "Go to last line"),
+    ]
+}
+
+impl<T: TreeViewItem> TreeView<T> {
+    pub fn on_enter(
+        &mut self,
+        cx: &mut Context,
+        params: &mut T::Params,
+        selected_index: usize,
+    ) -> Result<()> {
+        let selected_item = self.get_mut(selected_index)?;
+        if selected_item.is_opened {
+            selected_item.close();
+            self.regenerate_index();
+            return Ok(());
         }
 
         if let Some(mut on_open_fn) = self.on_opened_fn.take() {
-            let mut f = || {
-                let current = &mut self.items[self.selected];
-                let items = match on_open_fn(&mut current.item, cx, params) {
-                    TreeOp::Restore => {
-                        let inserts = std::mem::take(&mut current.folded);
-                        let _: Vec<_> = self
-                            .items
-                            .splice(self.selected + 1..self.selected + 1, inserts)
-                            .collect();
-                        return;
+            let mut f = || -> Result<()> {
+                let current = self.current_mut()?;
+                match on_open_fn(&mut current.item, cx, params) {
+                    TreeOp::GetChildsAndInsert => {
+                        if let Err(err) = current.open() {
+                            cx.editor.set_error(format!("{err}"))
+                        }
                     }
-                    TreeOp::InsertChild(items) => items,
-                    TreeOp::GetChildsAndInsert => match current.item.get_childs() {
-                        Ok(items) => items,
-                        Err(e) => return cx.editor.set_error(format!("{e}")),
-                    },
-                    TreeOp::ReplaceTree(items) => return self.replace_with_new_items(items),
-                    TreeOp::Noop => return,
+                    TreeOp::Noop => {}
                 };
-                current.folded = vec![];
-                let inserts = vec_to_tree(items, current.level + 1);
-                let _: Vec<_> = self
-                    .items
-                    .splice(self.selected + 1..self.selected + 1, inserts)
-                    .collect();
+                Ok(())
             };
-            f();
-            self.on_opened_fn = Some(on_open_fn)
-        } else {
-            let current = &mut self.items[self.selected];
-            let inserts = std::mem::take(&mut current.folded);
-            let _: Vec<_> = self
-                .items
-                .splice(self.selected + 1..self.selected + 1, inserts)
-                .collect();
-        }
-    }
-
-    pub fn fold_current_level(&mut self) {
-        let start = match self.find_parent(self.selected) {
-            Some(start) => start,
-            None => return,
+            f()?;
+            self.regenerate_index();
+            self.on_opened_fn = Some(on_open_fn);
         };
-        self.selected = start;
-        self.fold_current_child();
+        Ok(())
     }
 
-    pub fn fold_current_child(&mut self) {
-        if self.selected + 1 >= self.items.len() {
-            return;
-        }
-        let pos = self.next_not_descendant_pos(self.selected);
-        if self.selected < pos {
-            self.items[self.selected].folded = self.items.drain(self.selected + 1..pos).collect();
-        }
+    fn set_search_str(&mut self, s: String) {
+        self.search_str = s;
+        self.saved_view = None;
     }
 
-    pub fn search_next(&mut self, cx: &mut Context, s: &str, params: &mut T::Params) {
-        let skip = std::cmp::max(2, self.save_view.0 + 1);
-        self.selected = self
-            .find(skip, false, |e| e.item.filter(cx, s, params))
-            .unwrap_or(self.save_view.0);
-
-        self.winline = (self.save_view.1 + self.selected).saturating_sub(self.save_view.0);
+    fn saved_view(&self) -> SavedView {
+        self.saved_view.clone().unwrap_or(SavedView {
+            selected: self.selected,
+            winline: self.winline,
+        })
     }
 
-    pub fn search_pre(&mut self, cx: &mut Context, s: &str, params: &mut T::Params) {
-        let take = self.save_view.0;
-        self.selected = self
-            .find(take, true, |e| e.item.filter(cx, s, params))
-            .unwrap_or(self.save_view.0);
+    fn search_next(&mut self, s: &str) {
+        let saved_view = self.saved_view();
+        let skip = std::cmp::max(2, saved_view.selected + 1);
+        self.set_selected(
+            self.tree
+                .find(skip, Direction::Forward, |e| e.item.filter(s))
+                .unwrap_or(saved_view.selected),
+        );
+    }
 
-        self.winline = (self.save_view.1 + self.selected).saturating_sub(self.save_view.0);
+    fn search_previous(&mut self, s: &str) {
+        let saved_view = self.saved_view();
+        let take = saved_view.selected;
+        self.set_selected(
+            self.tree
+                .find(take, Direction::Backward, |e| e.item.filter(s))
+                .unwrap_or(saved_view.selected),
+        );
+    }
+
+    fn move_to_next_search_match(&mut self) {
+        self.search_next(&self.search_str.clone())
+    }
+
+    fn move_to_previous_next_match(&mut self) {
+        self.search_previous(&self.search_str.clone())
     }
 
     pub fn move_down(&mut self, rows: usize) {
-        let len = self.items.len();
-        if len > 0 {
-            self.selected = std::cmp::min(self.selected + rows, len.saturating_sub(1));
-            self.winline = std::cmp::min(self.selected, self.winline + rows);
+        self.set_selected(self.selected.saturating_add(rows))
+    }
+
+    fn set_selected(&mut self, selected: usize) {
+        let previous_selected = self.selected;
+        self.set_selected_without_history(selected);
+        if previous_selected.abs_diff(selected) > 1 {
+            self.backward_jumps.push(previous_selected)
+        }
+    }
+
+    fn set_selected_without_history(&mut self, selected: usize) {
+        let selected = selected.clamp(0, self.tree.len().saturating_sub(1));
+        if selected > self.selected {
+            // Move down
+            self.winline = selected.min(
+                self.winline
+                    .saturating_add(selected.saturating_sub(self.selected)),
+            );
+        } else {
+            // Move up
+            self.winline = selected.min(
+                self.winline
+                    .saturating_sub(self.selected.saturating_sub(selected)),
+            );
+        }
+        self.selected = selected
+    }
+
+    fn jump_backward(&mut self) {
+        if let Some(index) = self.backward_jumps.pop() {
+            self.forward_jumps.push(self.selected);
+            self.set_selected_without_history(index);
+        }
+    }
+
+    fn jump_forward(&mut self) {
+        if let Some(index) = self.forward_jumps.pop() {
+            self.set_selected(index)
         }
     }
 
     pub fn move_up(&mut self, rows: usize) {
-        let len = self.items.len();
-        if len > 0 {
-            self.selected = self.selected.saturating_sub(rows);
-            self.winline = std::cmp::min(self.selected, self.winline.saturating_sub(rows));
+        self.set_selected(self.selected.saturating_sub(rows))
+    }
+
+    fn move_to_next_sibling(&mut self) -> Result<()> {
+        if let Some(parent) = self.current_parent()? {
+            if let Some(local_index) = parent
+                .children
+                .iter()
+                .position(|child| child.index == self.selected)
+            {
+                if let Some(next_sibling) = parent.children.get(local_index.saturating_add(1)) {
+                    self.set_selected(next_sibling.index)
+                }
+            }
         }
+        Ok(())
     }
 
-    pub fn move_left(&mut self, cols: usize) {
-        self.col = self.col.saturating_sub(cols);
+    fn move_to_previous_sibling(&mut self) -> Result<()> {
+        if let Some(parent) = self.current_parent()? {
+            if let Some(local_index) = parent
+                .children
+                .iter()
+                .position(|child| child.index == self.selected)
+            {
+                if let Some(next_sibling) = parent.children.get(local_index.saturating_sub(1)) {
+                    self.set_selected(next_sibling.index)
+                }
+            }
+        }
+        Ok(())
     }
 
-    pub fn move_right(&mut self, cols: usize) {
-        self.pre_render = Some(Box::new(move |tree: &mut Self, area: Rect| {
-            let max_scroll = tree.max_len.saturating_sub(area.width as usize);
-            tree.col = max_scroll.min(tree.col + cols);
+    fn move_to_last_sibling(&mut self) -> Result<()> {
+        if let Some(parent) = self.current_parent()? {
+            if let Some(last) = parent.children.last() {
+                self.set_selected(last.index)
+            }
+        }
+        Ok(())
+    }
+
+    fn move_to_first_sibling(&mut self) -> Result<()> {
+        if let Some(parent) = self.current_parent()? {
+            if let Some(last) = parent.children.first() {
+                self.set_selected(last.index)
+            }
+        }
+        Ok(())
+    }
+
+    fn move_left(&mut self, cols: usize) {
+        self.column = self.column.saturating_sub(cols);
+    }
+
+    fn move_right(&mut self, cols: usize) {
+        self.pre_render = Some(Box::new(move |tree, area| {
+            let max_scroll = tree
+                .max_len
+                .saturating_sub(area.width as usize)
+                .saturating_add(1);
+            tree.column = max_scroll.min(tree.column + cols);
         }));
     }
 
-    pub fn move_down_half_page(&mut self) {
-        self.pre_render = Some(Box::new(|tree: &mut Self, area: Rect| {
+    fn move_down_half_page(&mut self) {
+        self.pre_render = Some(Box::new(|tree, area| {
             tree.move_down((area.height / 2) as usize);
         }));
     }
 
-    pub fn move_up_half_page(&mut self) {
-        self.pre_render = Some(Box::new(|tree: &mut Self, area: Rect| {
+    fn move_up_half_page(&mut self) {
+        self.pre_render = Some(Box::new(|tree, area| {
             tree.move_up((area.height / 2) as usize);
         }));
     }
 
-    pub fn move_down_page(&mut self) {
-        self.pre_render = Some(Box::new(|tree: &mut Self, area: Rect| {
+    fn move_down_page(&mut self) {
+        self.pre_render = Some(Box::new(|tree, area| {
             tree.move_down((area.height) as usize);
         }));
     }
 
-    pub fn move_up_page(&mut self) {
-        self.pre_render = Some(Box::new(|tree: &mut Self, area: Rect| {
+    fn move_up_page(&mut self) {
+        self.pre_render = Some(Box::new(|tree, area| {
             tree.move_up((area.height) as usize);
         }));
     }
 
-    pub fn save_view(&mut self) {
-        self.save_view = (self.selected, self.winline);
+    fn save_view(&mut self) {
+        self.saved_view = Some(SavedView {
+            selected: self.selected,
+            winline: self.winline,
+        })
     }
 
-    pub fn restore_view(&mut self) {
-        (self.selected, self.winline) = self.save_view;
+    fn get(&self, index: usize) -> Result<&Tree<T>> {
+        self.tree.get(index).ok_or_else(|| {
+            anyhow::anyhow!("Programming error: TreeView.get: index {index} is out of bound")
+        })
     }
 
-    pub fn current(&self) -> &Elem<T> {
-        &self.items[self.selected]
+    fn get_mut(&mut self, index: usize) -> Result<&mut Tree<T>> {
+        self.tree.get_mut(index).ok_or_else(|| {
+            anyhow::anyhow!("Programming error: TreeView.get_mut: index {index} is out of bound")
+        })
     }
 
-    pub fn current_item(&self) -> &T {
-        &self.items[self.selected].item
+    pub fn current(&self) -> Result<&Tree<T>> {
+        self.get(self.selected)
     }
 
-    pub fn row(&self) -> usize {
+    pub fn current_mut(&mut self) -> Result<&mut Tree<T>> {
+        self.get_mut(self.selected)
+    }
+
+    fn current_parent(&self) -> Result<Option<&Tree<T>>> {
+        if let Some(parent_index) = self.current()?.parent_index {
+            Ok(Some(self.get(parent_index)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn current_item(&self) -> Result<&T> {
+        Ok(&self.current()?.item)
+    }
+
+    pub fn winline(&self) -> usize {
         self.winline
-    }
-
-    pub fn remove_current(&mut self) -> T {
-        let elem = self.items.remove(self.selected);
-        self.selected = self.selected.saturating_sub(1);
-        elem.item
-    }
-
-    pub fn replace_current(&mut self, item: T) {
-        self.items[self.selected].item = item;
-    }
-
-    pub fn insert_current_level(&mut self, item: T) {
-        let current = self.current();
-        let level = current.level;
-        let pos = match current.item.cmp(&item) {
-            Ordering::Less => self
-                .find(self.selected + 1, false, |e| {
-                    e.level < level || (e.level == level && e.item.cmp(&item) != Ordering::Less)
-                })
-                .unwrap_or(self.items.len()),
-
-            Ordering::Greater => {
-                match self.find(self.selected, true, |elem| {
-                    elem.level < level
-                        || (elem.level == level && elem.item.cmp(&item) != Ordering::Greater)
-                }) {
-                    Some(p) if self.items[p].level == level => self.next_not_descendant_pos(p),
-                    Some(p) => p + 1,
-                    None => 0,
-                }
-            }
-            Ordering::Equal => self.selected + 1,
-        };
-        self.items.insert(pos, Elem::new(item, level));
     }
 }
 
-impl<T: TreeItem> Tree<T> {
+#[derive(Clone)]
+struct RenderedLine {
+    indent: String,
+    content: String,
+    selected: bool,
+    is_ancestor_of_current_item: bool,
+}
+struct RenderTreeParams<'a, T> {
+    tree: &'a Tree<T>,
+    prefix: &'a String,
+    level: usize,
+    selected: usize,
+}
+
+fn render_tree<T: TreeViewItem>(
+    RenderTreeParams {
+        tree,
+        prefix,
+        level,
+        selected,
+    }: RenderTreeParams<T>,
+) -> Vec<RenderedLine> {
+    let indent = if level > 0 {
+        let indicator = if tree.item().is_parent() {
+            if tree.is_opened {
+                "⏷"
+            } else {
+                "⏵"
+            }
+        } else {
+            " "
+        };
+        format!("{}{} ", prefix, indicator)
+    } else {
+        "".to_string()
+    };
+    let name = tree.item.name();
+    let head = RenderedLine {
+        indent,
+        selected: selected == tree.index,
+        is_ancestor_of_current_item: selected != tree.index && tree.get(selected).is_some(),
+        content: name,
+    };
+    let prefix = format!("{}{}", prefix, if level == 0 { "" } else { "  " });
+    vec![head]
+        .into_iter()
+        .chain(tree.children.iter().flat_map(|elem| {
+            render_tree(RenderTreeParams {
+                tree: elem,
+                prefix: &prefix,
+                level: level + 1,
+                selected,
+            })
+        }))
+        .collect()
+}
+
+impl<T: TreeViewItem + Clone> TreeView<T> {
     pub fn render(
         &mut self,
         area: Rect,
+        prompt_area: Rect,
         surface: &mut Surface,
         cx: &mut Context,
-        params: &mut T::Params,
     ) {
+        let style = cx.editor.theme.get(&self.tree_symbol_style);
+        if let Some((_, prompt)) = self.search_prompt.as_mut() {
+            prompt.render_prompt(prompt_area, surface, cx)
+        }
+
+        let ancestor_style = {
+            let style = cx.editor.theme.get("ui.selection");
+            let fg = cx.editor.theme.get("ui.text").fg;
+            match (style.fg, fg) {
+                (None, Some(fg)) => style.fg(fg),
+                _ => style,
+            }
+        };
+
+        let iter = self.render_lines(area).into_iter().enumerate();
+
+        for (index, line) in iter {
+            let area = Rect::new(area.x, area.y.saturating_add(index as u16), area.width, 1);
+            let indent_len = line.indent.chars().count() as u16;
+            surface.set_stringn(
+                area.x,
+                area.y,
+                line.indent.clone(),
+                indent_len as usize,
+                style,
+            );
+
+            let style = if line.selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            };
+            let x = area.x.saturating_add(indent_len);
+            surface.set_stringn(
+                x,
+                area.y,
+                line.content.clone(),
+                area.width
+                    .saturating_sub(indent_len)
+                    .saturating_sub(1)
+                    .into(),
+                if line.is_ancestor_of_current_item {
+                    ancestor_style
+                } else {
+                    style
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub fn render_to_string(&mut self, area: Rect) -> String {
+        let lines = self.render_lines(area);
+        lines
+            .into_iter()
+            .map(|line| {
+                let name = if line.selected {
+                    format!("({})", line.content)
+                } else if line.is_ancestor_of_current_item {
+                    format!("[{}]", line.content)
+                } else {
+                    line.content
+                };
+                format!("{}{}", line.indent, name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_lines(&mut self, area: Rect) -> Vec<RenderedLine> {
         if let Some(pre_render) = self.pre_render.take() {
             pre_render(self, area);
         }
 
-        self.max_len = 0;
-        self.winline = std::cmp::min(self.winline, area.height.saturating_sub(1) as usize);
-        let style = cx.editor.theme.get(&self.tree_symbol_style);
-        let last_item_index = self.items.len().saturating_sub(1);
+        self.winline = self.winline.min(area.height.saturating_sub(1) as usize);
         let skip = self.selected.saturating_sub(self.winline);
-        let iter = self
-            .items
-            .iter()
-            .skip(skip)
-            .take(area.height as usize)
-            .enumerate();
-        for (index, elem) in iter {
-            let row = index as u16;
-            let mut area = Rect::new(area.x, area.y + row, area.width, 1);
-            let indent = if elem.level > 0 {
-                if index + skip != last_item_index {
-                    format!("{}├─", "│ ".repeat(elem.level - 1))
-                } else {
-                    format!("└─{}", "┴─".repeat(elem.level - 1))
-                }
-            } else {
-                "".to_string()
-            };
+        let params = RenderTreeParams {
+            tree: &self.tree,
+            prefix: &"".to_string(),
+            level: 0,
+            selected: self.selected,
+        };
 
-            let indent_len = indent.chars().count();
-            if indent_len > self.col {
-                let indent: String = indent.chars().skip(self.col).collect();
-                if !indent.is_empty() {
-                    surface.set_stringn(area.x, area.y, &indent, area.width as usize, style);
-                    area = area.clip_left(indent.width() as u16);
-                }
-            };
-            let mut start_index = self.col.saturating_sub(indent_len);
-            let mut text = elem.item.text(cx, skip + index == self.selected, params);
-            self.max_len = self.max_len.max(text.width() + indent.len());
-            for span in text.0.iter_mut() {
-                if area.width == 0 {
-                    return;
-                }
-                if start_index == 0 {
-                    surface.set_span(area.x, area.y, span, area.width);
-                    area = area.clip_left(span.width() as u16);
-                } else {
-                    let span_width = span.width();
-                    if start_index > span_width {
-                        start_index -= span_width;
-                    } else {
-                        let content: String = span
-                            .content
-                            .chars()
-                            .filter(|c| {
-                                if start_index > 0 {
-                                    start_index = start_index.saturating_sub(c.to_string().width());
-                                    false
-                                } else {
-                                    true
-                                }
-                            })
-                            .collect();
-                        surface.set_string_truncated(
-                            area.x,
-                            area.y,
-                            &content,
-                            area.width as usize,
-                            |_| span.style,
-                            false,
-                            false,
-                        );
-                        start_index = 0
-                    }
+        let lines = render_tree(params);
+
+        self.max_len = lines
+            .iter()
+            .map(|line| {
+                line.indent
+                    .chars()
+                    .count()
+                    .saturating_add(line.content.chars().count())
+            })
+            .max()
+            .unwrap_or(0);
+
+        let max_width = area.width as usize;
+
+        let take = area.height as usize;
+
+        struct RetainAncestorResult {
+            skipped_ancestors: Vec<RenderedLine>,
+            remaining_lines: Vec<RenderedLine>,
+        }
+        fn retain_ancestors(lines: Vec<RenderedLine>, skip: usize) -> RetainAncestorResult {
+            if skip == 0 {
+                return RetainAncestorResult {
+                    skipped_ancestors: vec![],
+                    remaining_lines: lines,
+                };
+            }
+            if let Some(line) = lines.get(0) {
+                if line.selected {
+                    return RetainAncestorResult {
+                        skipped_ancestors: vec![],
+                        remaining_lines: lines,
+                    };
                 }
             }
+
+            let selected_index = lines.iter().position(|line| line.selected);
+            let skip = match selected_index {
+                None => skip,
+                Some(selected_index) => skip.min(selected_index),
+            };
+            let (skipped, remaining) = lines.split_at(skip.min(lines.len().saturating_sub(1)));
+
+            let skipped_ancestors = skipped
+                .iter()
+                .cloned()
+                .filter(|line| line.is_ancestor_of_current_item)
+                .collect::<Vec<_>>();
+
+            let result = retain_ancestors(remaining.to_vec(), skipped_ancestors.len());
+            RetainAncestorResult {
+                skipped_ancestors: skipped_ancestors
+                    .into_iter()
+                    .chain(result.skipped_ancestors.into_iter())
+                    .collect(),
+                remaining_lines: result.remaining_lines,
+            }
         }
+
+        let RetainAncestorResult {
+            skipped_ancestors,
+            remaining_lines,
+        } = retain_ancestors(lines, skip);
+
+        let max_ancestors_len = take.saturating_sub(1);
+
+        // Skip furthest ancestors
+        let skipped_ancestors = skipped_ancestors
+            .into_iter()
+            .rev()
+            .take(max_ancestors_len)
+            .rev()
+            .collect::<Vec<_>>();
+
+        let skipped_ancestors_len = skipped_ancestors.len();
+
+        skipped_ancestors
+            .into_iter()
+            .chain(
+                remaining_lines
+                    .into_iter()
+                    .take(take.saturating_sub(skipped_ancestors_len)),
+            )
+            // Horizontal scroll
+            .map(|line| {
+                let skip = self.column;
+                let indent_len = line.indent.chars().count();
+                RenderedLine {
+                    indent: if line.indent.is_empty() {
+                        "".to_string()
+                    } else {
+                        line.indent
+                            .chars()
+                            .skip(skip)
+                            .take(max_width)
+                            .collect::<String>()
+                    },
+                    content: line
+                        .content
+                        .chars()
+                        .skip(skip.saturating_sub(indent_len))
+                        .take((max_width.saturating_sub(indent_len)).clamp(0, line.content.len()))
+                        .collect::<String>(),
+                    ..line
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn handle_events(
+        &mut self,
+        events: &str,
+        cx: &mut Context,
+        params: &mut T::Params,
+    ) -> Result<()> {
+        use helix_view::input::parse_macro;
+
+        for event in parse_macro(events)? {
+            self.handle_event(&Event::Key(event), cx, params);
+        }
+        Ok(())
     }
 
     pub fn handle_event(
         &mut self,
-        event: Event,
+        event: &Event,
         cx: &mut Context,
         params: &mut T::Params,
     ) -> EventResult {
@@ -554,129 +1051,1631 @@ impl<T: TreeItem> Tree<T> {
             Event::Resize(..) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
-        if let Some(mut on_next_key) = self.on_next_key.take() {
-            on_next_key(cx, self, key_event);
-            return EventResult::Consumed(None);
-        }
-        let count = std::mem::replace(&mut self.count, 0);
-        match key_event.into() {
-            key!(i @ '0'..='9') => self.count = i.to_digit(10).unwrap() as usize + count * 10,
-            key!('k') | shift!(Tab) | key!(Up) | ctrl!('k') => self.move_up(1.max(count)),
-            key!('j') | key!(Tab) | key!(Down) | ctrl!('j') => self.move_down(1.max(count)),
-            key!('z') => self.fold_current_level(),
-            key!('h') => self.move_left(1.max(count)),
-            key!('l') => self.move_right(1.max(count)),
-            shift!('G') => self.move_down(usize::MAX / 2),
-            key!(Enter) => self.on_enter(cx, params),
-            ctrl!('d') => self.move_down_half_page(),
-            ctrl!('u') => self.move_up_half_page(),
-            shift!('D') => self.move_down_page(),
-            shift!('U') => self.move_up_page(),
-            key!('g') => {
-                self.on_next_key = Some(Box::new(|_, tree, event| match event.into() {
-                    key!('g') => tree.move_up(usize::MAX / 2),
-                    key!('e') => tree.move_down(usize::MAX / 2),
-                    _ => {}
-                }));
+        (|| -> Result<EventResult> {
+            if let Some(mut on_next_key) = self.on_next_key.take() {
+                on_next_key(cx, self, key_event)?;
+                return Ok(EventResult::Consumed(None));
             }
-            _ => return EventResult::Ignored(None),
-        }
 
-        EventResult::Consumed(None)
+            if let EventResult::Consumed(c) = self.handle_search_event(key_event, cx) {
+                return Ok(EventResult::Consumed(c));
+            }
+
+            let count = std::mem::replace(&mut self.count, 0);
+
+            match key_event {
+                key!(i @ '0'..='9') => {
+                    self.count = i.to_digit(10).unwrap_or(0) as usize + count * 10
+                }
+                shift!('J') => self.move_to_next_sibling()?,
+                shift!('K') => self.move_to_previous_sibling()?,
+                shift!('H') => self.move_to_first_sibling()?,
+                shift!('L') => self.move_to_last_sibling()?,
+                key!('j') | key!(Down) | ctrl!('n') => self.move_down(1.max(count)),
+                key!('k') | key!(Up) | ctrl!('p') => self.move_up(1.max(count)),
+                key!('h') | key!(Left) => self.move_to_parent()?,
+                key!('l') | key!(Right) => self.move_to_children()?,
+                key!(Enter) | key!('o') => self.on_enter(cx, params, self.selected)?,
+                ctrl!('d') => self.move_down_half_page(),
+                ctrl!('u') => self.move_up_half_page(),
+                key!('z') => {
+                    self.on_next_key = Some(Box::new(|_, tree, event| {
+                        match event {
+                            key!('z') => tree.align_view_center(),
+                            key!('t') => tree.align_view_top(),
+                            key!('b') => tree.align_view_bottom(),
+                            _ => {}
+                        };
+                        Ok(())
+                    }));
+                }
+                key!('g') => {
+                    self.on_next_key = Some(Box::new(|_, tree, event| {
+                        match event {
+                            key!('g') => tree.move_to_first_line(),
+                            key!('e') => tree.move_to_last_line(),
+                            key!('h') => tree.move_leftmost(),
+                            key!('l') => tree.move_rightmost(),
+                            _ => {}
+                        };
+                        Ok(())
+                    }));
+                }
+                key!('/') => self.new_search_prompt(Direction::Forward),
+                key!('n') => self.move_to_next_search_match(),
+                shift!('N') => self.move_to_previous_next_match(),
+                key!(PageDown) => self.move_down_page(),
+                key!(PageUp) => self.move_up_page(),
+                shift!('R') => {
+                    if let Err(error) = self.refresh() {
+                        cx.editor.set_error(error.to_string())
+                    }
+                }
+                key!(Home) => self.move_leftmost(),
+                key!(End) => self.move_rightmost(),
+                ctrl!('o') => self.jump_backward(),
+                ctrl!('i') | key!(Tab) => self.jump_forward(),
+                _ => return Ok(EventResult::Ignored(None)),
+            };
+            Ok(EventResult::Consumed(None))
+        })()
+        .unwrap_or_else(|err| {
+            cx.editor.set_error(format!("{err}"));
+            EventResult::Consumed(None)
+        })
+    }
+
+    fn handle_search_event(&mut self, event: &KeyEvent, cx: &mut Context) -> EventResult {
+        if let Some((direction, mut prompt)) = self.search_prompt.take() {
+            match event {
+                key!(Enter) => {
+                    self.set_search_str(prompt.line().clone());
+                    EventResult::Consumed(None)
+                }
+                key!(Esc) => {
+                    if let Err(err) = self.restore_saved_view() {
+                        cx.editor.set_error(format!("{err}"))
+                    }
+                    EventResult::Consumed(None)
+                }
+                _ => {
+                    let event = prompt.handle_event(&Event::Key(*event), cx);
+                    let line = prompt.line();
+                    match direction {
+                        Direction::Forward => {
+                            self.search_next(line);
+                        }
+                        Direction::Backward => self.search_previous(line),
+                    }
+                    self.search_prompt = Some((direction, prompt));
+                    event
+                }
+            }
+        } else {
+            EventResult::Ignored(None)
+        }
+    }
+
+    fn new_search_prompt(&mut self, direction: Direction) {
+        self.save_view();
+        self.search_prompt = Some((
+            direction,
+            Prompt::new("search: ".into(), None, ui::completers::none, |_, _, _| {}),
+        ))
+    }
+
+    pub fn prompting(&self) -> bool {
+        self.search_prompt.is_some() || self.on_next_key.is_some()
     }
 }
 
-impl<T: TreeItem + Clone> Tree<T> {
-    pub fn filter(&mut self, s: &str, cx: &mut Context, params: &mut T::Params) {
-        fn filter_recursion<T>(
-            elems: &Vec<Elem<T>>,
-            mut index: usize,
-            s: &str,
-            cx: &mut Context,
-            params: &mut T::Params,
-        ) -> (Vec<Elem<T>>, usize)
-        where
-            T: TreeItem + Clone,
-        {
-            let mut retain = vec![];
-            let elem = &elems[index];
-            loop {
-                let child = match elems.get(index + 1) {
-                    Some(child) if child.item.is_child(&elem.item) => child,
-                    _ => break,
+/// Recalculate the index of each item of a tree.
+///
+/// For example:
+///
+/// ```txt
+/// foo (0)
+///   bar (1)
+/// spam (2)
+///   jar (3)
+///     yo (4)
+/// ```
+fn index_elems<T>(parent_index: usize, elems: Vec<Tree<T>>) -> Vec<Tree<T>> {
+    fn index_elems<T>(
+        current_index: usize,
+        elems: Vec<Tree<T>>,
+        parent_index: usize,
+    ) -> (usize, Vec<Tree<T>>) {
+        elems
+            .into_iter()
+            .fold((current_index, vec![]), |(current_index, trees), elem| {
+                let index = current_index;
+                let item = elem.item;
+                let (current_index, folded) = index_elems(current_index + 1, elem.children, index);
+                let tree = Tree {
+                    item,
+                    children: folded,
+                    index,
+                    is_opened: elem.is_opened,
+                    parent_index: Some(parent_index),
                 };
-                index += 1;
-                let next = elems.get(index + 1);
-                if next.map_or(false, |n| n.item.is_child(&child.item)) {
-                    let (sub_retain, current_index) = filter_recursion(elems, index, s, cx, params);
-                    retain.extend(sub_retain);
-                    index = current_index;
-                } else if child.item.filter(cx, s, params) {
-                    retain.push(child.clone());
+                (
+                    current_index,
+                    trees.into_iter().chain(vec![tree].into_iter()).collect(),
+                )
+            })
+    }
+    index_elems(parent_index + 1, elems, parent_index).1
+}
+
+#[cfg(test)]
+mod test_tree_view {
+
+    use helix_view::graphics::Rect;
+
+    use crate::compositor::Context;
+
+    use super::{TreeView, TreeViewItem};
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+    /// The children of DivisibleItem is the division of itself.
+    /// This is used to ease the creation of a dummy tree without having to specify so many things.
+    struct DivisibleItem<'a> {
+        name: &'a str,
+    }
+
+    fn item(name: &str) -> DivisibleItem {
+        DivisibleItem { name }
+    }
+
+    impl<'a> TreeViewItem for DivisibleItem<'a> {
+        type Params = ();
+
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+
+        fn is_parent(&self) -> bool {
+            self.name.len() > 2
+        }
+
+        fn get_children(&self) -> anyhow::Result<Vec<Self>> {
+            if self.name.eq("who_lives_in_a_pineapple_under_the_sea") {
+                Ok(vec![
+                    item("gary_the_snail"),
+                    item("krabby_patty"),
+                    item("larry_the_lobster"),
+                    item("patrick_star"),
+                    item("sandy_cheeks"),
+                    item("spongebob_squarepants"),
+                    item("mrs_puff"),
+                    item("king_neptune"),
+                    item("karen"),
+                    item("plankton"),
+                ])
+            } else if self.is_parent() {
+                let (left, right) = self.name.split_at(self.name.len() / 2);
+                Ok(vec![item(left), item(right)])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    fn dummy_tree_view<'a>() -> TreeView<DivisibleItem<'a>> {
+        TreeView::build_tree(item("who_lives_in_a_pineapple_under_the_sea")).unwrap()
+    }
+
+    fn dummy_area() -> Rect {
+        Rect::new(0, 0, 50, 5)
+    }
+
+    fn render(view: &mut TreeView<DivisibleItem>) -> String {
+        view.render_to_string(dummy_area())
+    }
+
+    #[test]
+    fn test_init() {
+        let mut view = dummy_tree_view();
+
+        // Expect the items to be sorted
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_up_down() {
+        let mut view = dummy_tree_view();
+        view.move_down(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ (gary_the_snail)
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_down(3);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+"
+            .trim()
+        );
+
+        view.move_down(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+"
+            .trim()
+        );
+
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+⏵ larry_the_lobster
+"
+            .trim()
+        );
+
+        view.move_up(3);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ (gary_the_snail)
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_to_first_line();
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_to_last_line();
+        view.move_down(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ patrick_star
+⏵ plankton
+⏵ sandy_cheeks
+⏵ (spongebob_squarepants)
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_to_first_last_sibling() {
+        let mut view = dummy_tree_view();
+        view.move_to_children().unwrap();
+        view.move_to_children().unwrap();
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ (gary_the_snail)
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_last_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ patrick_star
+⏵ plankton
+⏵ sandy_cheeks
+⏵ (spongebob_squarepants)
+"
+            .trim()
+        );
+
+        view.move_to_first_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ (gary_the_snail)
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_to_previous_next_sibling() {
+        let mut view = dummy_tree_view();
+        view.move_to_children().unwrap();
+        view.move_to_children().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ (e_snail)
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_next_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ e_snail
+  ⏵ (gary_th)
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_next_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ e_snail
+  ⏵ (gary_th)
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_previous_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ (e_snail)
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_previous_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ (e_snail)
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ (gary_the_snail)
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_next_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ gary_the_snail
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ (karen)
+"
+            .trim()
+        );
+
+        view.move_to_previous_sibling().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ (gary_the_snail)
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_align_view() {
+        let mut view = dummy_tree_view();
+        view.move_down(5);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+"
+            .trim()
+        );
+
+        view.align_view_center();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+⏵ mrs_puff
+⏵ patrick_star
+"
+            .trim()
+        );
+
+        view.align_view_bottom();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_to_first_last() {
+        let mut view = dummy_tree_view();
+
+        view.move_to_last_line();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ patrick_star
+⏵ plankton
+⏵ sandy_cheeks
+⏵ (spongebob_squarepants)
+"
+            .trim()
+        );
+
+        view.move_to_first_line();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_half() {
+        let mut view = dummy_tree_view();
+        view.move_down_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ (karen)
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_down_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+"
+            .trim()
+        );
+
+        view.move_down_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ king_neptune
+⏵ krabby_patty
+⏵ larry_the_lobster
+⏵ (mrs_puff)
+"
+            .trim()
+        );
+
+        view.move_up_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ king_neptune
+⏵ (krabby_patty)
+⏵ larry_the_lobster
+⏵ mrs_puff
+"
+            .trim()
+        );
+
+        view.move_up_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ (karen)
+⏵ king_neptune
+⏵ krabby_patty
+⏵ larry_the_lobster
+"
+            .trim()
+        );
+
+        view.move_up_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn move_to_children_parent() {
+        let mut view = dummy_tree_view();
+        view.move_down(1);
+        view.move_to_children().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ (e_snail)
+  ⏵ gary_th
+⏵ karen
+ "
+            .trim()
+        );
+
+        view.move_down(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ e_snail
+  ⏵ (gary_th)
+⏵ karen
+ "
+            .trim()
+        );
+
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ (gary_the_snail)
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+ "
+            .trim()
+        );
+
+        view.move_to_last_line();
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏷ gary_the_snail
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+ "
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_left_right() {
+        let mut view = dummy_tree_view();
+
+        fn render(view: &mut TreeView<DivisibleItem>) -> String {
+            view.render_to_string(dummy_area().with_width(20))
+        }
+
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pinea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_right(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(ho_lives_in_a_pineap)
+ gary_the_snail
+ karen
+ king_neptune
+ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_right(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(o_lives_in_a_pineapp)
+gary_the_snail
+karen
+king_neptune
+krabby_patty
+"
+            .trim()
+        );
+
+        view.move_right(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(_lives_in_a_pineappl)
+ary_the_snail
+aren
+ing_neptune
+rabby_patty
+"
+            .trim()
+        );
+
+        view.move_left(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(o_lives_in_a_pineapp)
+gary_the_snail
+karen
+king_neptune
+krabby_patty
+"
+            .trim()
+        );
+
+        view.move_leftmost();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pinea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_left(1);
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pinea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_rightmost();
+        assert_eq!(render(&mut view), "(apple_under_the_sea)\n\n\n\n");
+    }
+
+    #[test]
+    fn test_move_to_parent_child() {
+        let mut view = dummy_tree_view();
+
+        view.move_to_children().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ (gary_the_snail)
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+
+        view.move_to_children().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ (e_snail)
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_down(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ [gary_the_snail]
+  ⏵ e_snail
+  ⏵ (gary_th)
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏷ (gary_the_snail)
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏷ gary_the_snail
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        );
+
+        view.move_to_parent().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏷ gary_the_snail
+  ⏵ e_snail
+  ⏵ gary_th
+⏵ karen
+"
+            .trim()
+        )
+    }
+
+    #[test]
+    fn test_search_next() {
+        let mut view = dummy_tree_view();
+
+        view.search_next("pat");
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+"
+            .trim()
+        );
+
+        view.search_next("larr");
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+"
+            .trim()
+        );
+
+        view.move_to_last_line();
+        view.search_next("who_lives");
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_search_previous() {
+        let mut view = dummy_tree_view();
+
+        view.search_previous("larry");
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+"
+            .trim()
+        );
+
+        view.move_to_last_line();
+        view.search_previous("krab");
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+⏵ larry_the_lobster
+"
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_to_next_search_match() {
+        let mut view = dummy_tree_view();
+        view.set_search_str("pat".to_string());
+        view.move_to_next_search_match();
+
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+ "
+            .trim()
+        );
+
+        view.move_to_next_search_match();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ krabby_patty
+⏵ larry_the_lobster
+⏵ mrs_puff
+⏵ (patrick_star)
+ "
+            .trim()
+        );
+
+        view.move_to_next_search_match();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ (krabby_patty)
+⏵ larry_the_lobster
+⏵ mrs_puff
+⏵ patrick_star
+ "
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_move_to_previous_search_match() {
+        let mut view = dummy_tree_view();
+        view.set_search_str("pat".to_string());
+        view.move_to_previous_next_match();
+
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ krabby_patty
+⏵ larry_the_lobster
+⏵ mrs_puff
+⏵ (patrick_star)
+ "
+            .trim()
+        );
+
+        view.move_to_previous_next_match();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ (krabby_patty)
+⏵ larry_the_lobster
+⏵ mrs_puff
+⏵ patrick_star
+ "
+            .trim()
+        );
+
+        view.move_to_previous_next_match();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ krabby_patty
+⏵ larry_the_lobster
+⏵ mrs_puff
+⏵ (patrick_star)
+ "
+            .trim()
+        );
+    }
+
+    #[test]
+    fn test_jump_backward_forward() {
+        let mut view = dummy_tree_view();
+        view.move_down_half_page();
+        render(&mut view);
+
+        view.move_down_half_page();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+          "
+            .trim()
+        );
+
+        view.jump_backward();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ (karen)
+⏵ king_neptune
+⏵ krabby_patty
+          "
+            .trim()
+        );
+
+        view.jump_backward();
+        assert_eq!(
+            render(&mut view),
+            "
+(who_lives_in_a_pineapple_under_the_sea)
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+          "
+            .trim()
+        );
+
+        view.jump_forward();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ (karen)
+⏵ king_neptune
+⏵ krabby_patty
+          "
+            .trim()
+        );
+
+        view.jump_forward();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ karen
+⏵ king_neptune
+⏵ (krabby_patty)
+          "
+            .trim()
+        );
+
+        view.jump_backward();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ gary_the_snail
+⏵ (karen)
+⏵ king_neptune
+⏵ krabby_patty
+          "
+            .trim()
+        );
+    }
+
+    mod static_tree {
+        use crate::ui::{TreeView, TreeViewItem};
+
+        use super::dummy_area;
+
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+        /// This is used for test cases where the structure of the tree has to be known upfront
+        pub struct StaticItem<'a> {
+            pub name: &'a str,
+            pub children: Option<Vec<StaticItem<'a>>>,
+        }
+
+        pub fn parent<'a>(name: &'a str, children: Vec<StaticItem<'a>>) -> StaticItem<'a> {
+            StaticItem {
+                name,
+                children: Some(children),
+            }
+        }
+
+        pub fn child(name: &str) -> StaticItem {
+            StaticItem {
+                name,
+                children: None,
+            }
+        }
+
+        impl<'a> TreeViewItem for StaticItem<'a> {
+            type Params = ();
+
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn is_parent(&self) -> bool {
+                self.children.is_some()
+            }
+
+            fn get_children(&self) -> anyhow::Result<Vec<Self>> {
+                match &self.children {
+                    Some(children) => Ok(children.clone()),
+                    None => Ok(vec![]),
                 }
             }
-            if !retain.is_empty() || elem.item.filter(cx, s, params) {
-                retain.insert(0, elem.clone());
-            }
-            (retain, index)
         }
 
-        if s.is_empty() {
-            if let Some((_, recycle)) = self.recycle.take() {
-                self.items = recycle;
-                self.restore_view();
-                return;
-            }
+        pub fn render(view: &mut TreeView<StaticItem<'_>>) -> String {
+            view.render_to_string(dummy_area().with_height(3))
         }
-
-        let mut retain = vec![];
-        let mut index = 0;
-        let items = match &self.recycle {
-            Some((pre, _)) if pre == s => return,
-            Some((pre, recycle)) if pre.contains(s) => recycle,
-            _ => &self.items,
-        };
-        while let Some(elem) = items.get(index) {
-            let next = items.get(index + 1);
-            if next.map_or(false, |n| n.item.is_child(&elem.item)) {
-                let (sub_items, current_index) = filter_recursion(items, index, s, cx, params);
-                index = current_index;
-                retain.extend(sub_items);
-            } else if elem.item.filter(cx, s, params) {
-                retain.push(elem.clone())
-            }
-            index += 1;
-        }
-
-        if retain.is_empty() {
-            if let Some((_, recycle)) = self.recycle.take() {
-                self.items = recycle;
-                self.restore_view();
-            }
-            return;
-        }
-
-        let recycle = std::mem::replace(&mut self.items, retain);
-        if let Some(r) = self.recycle.as_mut() {
-            r.0 = s.into()
-        } else {
-            self.recycle = Some((s.into(), recycle));
-            self.save_view();
-        }
-
-        self.selected = self
-            .find(0, false, |elem| elem.item.filter(cx, s, params))
-            .unwrap_or(0);
-        self.winline = self.selected;
     }
 
-    pub fn clean_recycle(&mut self) {
-        self.recycle = None;
+    #[test]
+    fn test_sticky_ancestors() {
+        // The ancestors of the current item should always be visible
+        // However, if there's not enough space, the current item will take precedence,
+        // and the nearest ancestor has higher precedence than further ancestors
+        use static_tree::*;
+
+        let mut view = TreeView::build_tree(parent(
+            "root",
+            vec![
+                parent("a", vec![child("aa"), child("ab")]),
+                parent(
+                    "b",
+                    vec![parent(
+                        "ba",
+                        vec![parent("baa", vec![child("baaa"), child("baab")])],
+                    )],
+                ),
+            ],
+        ))
+        .unwrap();
+
+        assert_eq!(
+            render(&mut view),
+            "
+(root)
+⏵ a
+⏵ b
+          "
+            .trim()
+        );
+
+        // 1. Move down to "a", and expand it
+        view.move_down(1);
+        view.move_to_children().unwrap();
+
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ [a]
+    (aa)
+          "
+            .trim()
+        );
+
+        // 2. Move down by 1
+        view.move_down(1);
+
+        // 2a. Expect all ancestors (i.e. "root" and "a") are visible,
+        //     and the cursor is at "ab"
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ [a]
+    (ab)
+          "
+            .trim()
+        );
+
+        // 3. Move down by 1
+        view.move_down(1);
+
+        // 3a. Expect "a" is out of view, because it is no longer the ancestor of the current item
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+    ab
+⏵ (b)
+          "
+            .trim()
+        );
+
+        // 4. Move to the children of "b", which is "ba"
+        view.move_to_children().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ [b]
+  ⏵ (ba)
+          "
+            .trim()
+        );
+
+        // 5. Move to the children of "ba", which is "baa"
+        view.move_to_children().unwrap();
+
+        // 5a. Expect the furthest ancestor "root" is out of view,
+        //     because when there's no enough space, the nearest ancestor takes precedence
+        assert_eq!(
+            render(&mut view),
+            "
+⏷ [b]
+  ⏷ [ba]
+    ⏵ (baa)
+          "
+            .trim()
+        );
+
+        // 5.1 Move to child
+        view.move_to_children().unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+  ⏷ [ba]
+    ⏷ [baa]
+        (baaa)
+"
+            .trim_matches('\n')
+        );
+
+        // 5.2 Move down
+        view.move_down(1);
+        assert_eq!(
+            render(&mut view),
+            "
+  ⏷ [ba]
+    ⏷ [baa]
+        (baab)
+"
+            .trim_matches('\n')
+        );
+
+        // 5.3 Move up
+        view.move_up(1);
+        assert_eq!(view.current_item().unwrap().name, "baaa");
+        assert_eq!(
+            render(&mut view),
+            "
+  ⏷ [ba]
+    ⏷ [baa]
+        (baaa)
+"
+            .trim_matches('\n')
+        );
+
+        // 5.4 Move up
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+⏷ [b]
+  ⏷ [ba]
+    ⏷ (baa)
+          "
+            .trim()
+        );
+
+        // 6. Move up by one
+        view.move_up(1);
+
+        // 6a. Expect "root" is visible again, because now there's enough space to render all
+        //     ancestors
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ [b]
+  ⏷ (ba)
+          "
+            .trim()
+        );
+
+        // 7. Move up by one
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ (b)
+  ⏷ ba
+          "
+            .trim()
+        );
+
+        // 8. Move up by one
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ [a]
+    (ab)
+          "
+            .trim()
+        );
+
+        // 9. Move up by one
+        view.move_up(1);
+        assert_eq!(
+            render(&mut view),
+            "
+[root]
+⏷ [a]
+    (aa)
+          "
+            .trim()
+        );
     }
 
-    pub fn restore_recycle(&mut self) {
-        if let Some((_, recycle)) = self.recycle.take() {
-            self.items = recycle;
-        }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_prompt() {
+        let mut editor = Context::dummy_editor();
+        let mut jobs = Context::dummy_jobs();
+        let mut cx = Context::dummy(&mut jobs, &mut editor);
+        let mut view = dummy_tree_view();
+
+        view.handle_events("/an", &mut cx, &mut ()).unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ larry_the_lobster
+⏵ mrs_puff
+⏵ patrick_star
+⏵ (plankton)
+            "
+            .trim()
+        );
+
+        view.handle_events("t<ret>", &mut cx, &mut ()).unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ patrick_star
+⏵ plankton
+⏵ sandy_cheeks
+⏵ (spongebob_squarepants)
+            "
+            .trim()
+        );
+
+        view.handle_events("/larry", &mut cx, &mut ()).unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ karen
+⏵ king_neptune
+⏵ krabby_patty
+⏵ (larry_the_lobster)
+           "
+            .trim()
+        );
+
+        view.handle_events("<esc>", &mut cx, &mut ()).unwrap();
+        assert_eq!(
+            render(&mut view),
+            "
+[who_lives_in_a_pineapple_under_the_sea]
+⏵ patrick_star
+⏵ plankton
+⏵ sandy_cheeks
+⏵ (spongebob_squarepants)
+           "
+            .trim()
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_tree {
+    use helix_core::movement::Direction;
+
+    use super::Tree;
+
+    #[test]
+    fn test_get() {
+        let result = Tree::new(
+            "root",
+            vec![
+                Tree::new("foo", vec![Tree::new("bar", vec![])]),
+                Tree::new(
+                    "spam",
+                    vec![Tree::new("jar", vec![Tree::new("yo", vec![])])],
+                ),
+            ],
+        );
+        assert_eq!(result.get(0).unwrap().item, "root");
+        assert_eq!(result.get(1).unwrap().item, "foo");
+        assert_eq!(result.get(2).unwrap().item, "bar");
+        assert_eq!(result.get(3).unwrap().item, "spam");
+        assert_eq!(result.get(4).unwrap().item, "jar");
+        assert_eq!(result.get(5).unwrap().item, "yo");
+    }
+
+    #[test]
+    fn test_iter() {
+        let tree = Tree::new(
+            "spam",
+            vec![
+                Tree::new("jar", vec![Tree::new("yo", vec![])]),
+                Tree::new("foo", vec![Tree::new("bar", vec![])]),
+            ],
+        );
+
+        let mut iter = tree.iter();
+        assert_eq!(iter.next().map(|tree| tree.item), Some("spam"));
+        assert_eq!(iter.next().map(|tree| tree.item), Some("jar"));
+        assert_eq!(iter.next().map(|tree| tree.item), Some("yo"));
+        assert_eq!(iter.next().map(|tree| tree.item), Some("foo"));
+        assert_eq!(iter.next().map(|tree| tree.item), Some("bar"));
+
+        assert_eq!(iter.next().map(|tree| tree.item), None)
+    }
+
+    #[test]
+    fn test_iter_double_ended() {
+        let tree = Tree::new(
+            "spam",
+            vec![
+                Tree::new("jar", vec![Tree::new("yo", vec![])]),
+                Tree::new("foo", vec![Tree::new("bar", vec![])]),
+            ],
+        );
+
+        let mut iter = tree.iter();
+        assert_eq!(iter.next_back().map(|tree| tree.item), Some("bar"));
+        assert_eq!(iter.next_back().map(|tree| tree.item), Some("foo"));
+        assert_eq!(iter.next_back().map(|tree| tree.item), Some("yo"));
+        assert_eq!(iter.next_back().map(|tree| tree.item), Some("jar"));
+        assert_eq!(iter.next_back().map(|tree| tree.item), Some("spam"));
+        assert_eq!(iter.next_back().map(|tree| tree.item), None)
+    }
+
+    #[test]
+    fn test_len() {
+        let tree = Tree::new(
+            "spam",
+            vec![
+                Tree::new("jar", vec![Tree::new("yo", vec![])]),
+                Tree::new("foo", vec![Tree::new("bar", vec![])]),
+            ],
+        );
+
+        assert_eq!(tree.len(), 5)
+    }
+
+    #[test]
+    fn test_find_forward() {
+        let tree = Tree::new(
+            ".cargo",
+            vec![
+                Tree::new("jar", vec![Tree::new("Cargo.toml", vec![])]),
+                Tree::new("Cargo.toml", vec![Tree::new("bar", vec![])]),
+            ],
+        );
+        let result = tree.find(0, Direction::Forward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(0));
+
+        let result = tree.find(1, Direction::Forward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(2));
+
+        let result = tree.find(2, Direction::Forward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(2));
+
+        let result = tree.find(3, Direction::Forward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(3));
+
+        let result = tree.find(4, Direction::Forward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn test_find_backward() {
+        let tree = Tree::new(
+            ".cargo",
+            vec![
+                Tree::new("jar", vec![Tree::new("Cargo.toml", vec![])]),
+                Tree::new("Cargo.toml", vec![Tree::new("bar", vec![])]),
+            ],
+        );
+        let result = tree.find(0, Direction::Backward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(3));
+
+        let result = tree.find(1, Direction::Backward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(0));
+
+        let result = tree.find(2, Direction::Backward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(0));
+
+        let result = tree.find(3, Direction::Backward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(2));
+
+        let result = tree.find(4, Direction::Backward, |tree| {
+            tree.item.to_lowercase().contains(&"cargo".to_lowercase())
+        });
+
+        assert_eq!(result, Some(3));
     }
 }

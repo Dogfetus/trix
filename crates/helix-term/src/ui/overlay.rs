@@ -19,11 +19,12 @@ pub struct Overlay<T> {
 pub fn overlaid<T>(content: T) -> Overlay<T> {
     Overlay {
         content,
-        calc_child_size: Box::new(|rect: Rect| clip_rect_relative(rect.clip_bottom(2), 90, 90)),
+        calc_child_size: Box::new(|rect: Rect| rect.overlaid()),
     }
 }
 
-fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: u8) -> Rect {
+/// dead  code?? why? idk? comming soon
+fn _clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: u8) -> Rect {
     fn mul_and_cast(size: u16, factor: u8) -> u16 {
         ((size as u32) * (factor as u32) / 100).try_into().unwrap()
     }

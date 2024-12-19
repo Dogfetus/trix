@@ -134,7 +134,14 @@ impl Application {
         let backend = TestBackend::new(120, 150);
 
         let terminal = Terminal::new(backend)?;
-        let area = terminal.size().expect("couldn't get terminal size");
+        // let area = terminal.size().expect("couldn't get terminal size");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
+        println!("area: {:?}", area);
         let mut compositor = Compositor::new(area);
         let config = Arc::new(ArcSwap::from_pointee(config));
         let handlers = handlers::setup(config.clone());

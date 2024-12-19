@@ -568,9 +568,12 @@ impl MappableCommand {
         command_palette, "Open command palette",
         goto_word, "Jump to a two-character label",
         extend_to_word, "Extend to a two-character label",
-        toggle_explorer, "Toggle/focus the explorer",
-        open_explorer, "Open the explorer window",
-        close_explorer, "Close the explorer window",
+        // toggle_explorer, "Toggle/focus the explorer",
+        // open_explorer, "Open the explorer window",
+        // close_explorer, "Close the explorer window",
+        open_file_tree, "Open the file tree explorer",
+        close_file_tree, "Close the file tree explorer",
+        toggle_file_tree, "Focus the file tree",
     );
 }
 
@@ -3223,14 +3226,51 @@ fn changed_file_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
-fn toggle_explorer(cx: &mut Context) {
+// fn toggle_explorer(cx: &mut Context) {
+//     cx.callback.push(Box::new(
+//         |compositor: &mut Compositor, cx: &mut compositor::Context| {
+//             if let Some(editor) = compositor.find::<ui::EditorView>() {
+//                 match editor.explorer.as_mut() {
+//                     Some(explore) => explore.content.focus(),
+//                     None => match ui::Explorer::new(cx) {
+//                         Ok(explore) => editor.explorer = Some(overlaid(explore)),
+//                         Err(err) => cx.editor.set_error(format!("{}", err)),
+//                     },
+//                 }
+//             }
+//         },
+//     ));
+// }
+
+// fn open_explorer(cx: &mut Context) {
+//     cx.callback.push(Box::new(
+//         |compositor: &mut Compositor, cx: &mut compositor::Context| {
+//             if let Some(editor) = compositor.find::<ui::EditorView>() {
+//                 match ui::Explorer::new_explorer_recursion() {
+//                     Ok(explore) => editor.explorer = Some(overlaid(explore)),
+//                     Err(err) => cx.editor.set_error(format!("{}", err)),
+//                 }
+//             }
+//         },
+//     ));
+// }
+
+// fn close_explorer(cx: &mut Context) {
+//     cx.callback.push(Box::new(|compositor: &mut Compositor, _| {
+//         if let Some(editor) = compositor.find::<ui::EditorView>() {
+//             editor.explorer.take();
+//         }
+//     }));
+// }
+
+fn open_file_tree(cx: &mut Context) {
     cx.callback.push(Box::new(
         |compositor: &mut Compositor, cx: &mut compositor::Context| {
             if let Some(editor) = compositor.find::<ui::EditorView>() {
                 match editor.explorer.as_mut() {
-                    Some(explore) => explore.content.focus(),
+                    Some(explore) => explore.focus(),
                     None => match ui::Explorer::new(cx) {
-                        Ok(explore) => editor.explorer = Some(overlaid(explore)),
+                        Ok(explore) => editor.explorer = Some(explore),
                         Err(err) => cx.editor.set_error(format!("{}", err)),
                     },
                 }
@@ -3239,26 +3279,34 @@ fn toggle_explorer(cx: &mut Context) {
     ));
 }
 
-fn open_explorer(cx: &mut Context) {
+fn reveal_file_in_file_tree(cx: &mut Context, path: Option<PathBuf>) {
     cx.callback.push(Box::new(
         |compositor: &mut Compositor, cx: &mut compositor::Context| {
             if let Some(editor) = compositor.find::<ui::EditorView>() {
-                match ui::Explorer::new_explorer_recursion() {
-                    Ok(explore) => editor.explorer = Some(overlaid(explore)),
-                    Err(err) => cx.editor.set_error(format!("{}", err)),
-                }
+                (|| match editor.explorer.as_mut() {
+                    Some(explorer) => match path {
+                        Some(path) => explorer.reveal_file(path),
+                        None => explorer.reveal_current_file(cx),
+                    },
+                    None => {
+                        editor.explorer = Some(ui::Explorer::new(cx)?);
+                        if let Some(explorer) = editor.explorer.as_mut() {
+                            explorer.reveal_current_file(cx)?;
+                        }
+                        Ok(())
+                    }
+                })()
+                .unwrap_or_else(|err| cx.editor.set_error(err.to_string()))
             }
         },
     ));
 }
 
-fn close_explorer(cx: &mut Context) {
-    cx.callback.push(Box::new(|compositor: &mut Compositor, _| {
-        if let Some(editor) = compositor.find::<ui::EditorView>() {
-            editor.explorer.take();
-        }
-    }));
+fn toggle_file_tree(cx: &mut Context) {
+    reveal_file_in_file_tree(cx, None)
 }
+
+fn close_file_tree(_cx: &mut Context) {}
 
 pub fn command_palette(cx: &mut Context) {
     let register = cx.register;
