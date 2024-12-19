@@ -19,6 +19,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "R" => replace_with_yanked,
         "A-." =>  repeat_last_motion,
 
+        "C-;" => toggle_file_tree,
         "C-f" => { "File Explorer"
             // "e" => open_explorer,
             // "r" => close_explorer,
