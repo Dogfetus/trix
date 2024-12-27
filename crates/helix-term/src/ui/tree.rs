@@ -780,6 +780,9 @@ struct RenderTreeParams<'a, T> {
     level: usize,
     selected: usize,
 }
+// fn color_blue(text: String) -> String {
+//     format!("\x1b[34m{}\x1b[0m", text) // ANSI escape code for blue text
+// }
 
 fn render_tree<T: TreeViewItem>(
     RenderTreeParams {

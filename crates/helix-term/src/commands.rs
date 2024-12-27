@@ -2949,7 +2949,6 @@ fn file_picker(cx: &mut Context) {
     }
     let picker = ui::file_picker(root, &cx.editor.config());
     cx.push_layer(Box::new(overlaid(picker)));
-    update_file_tree(cx);
 }
 
 fn file_picker_in_current_buffer_directory(cx: &mut Context) {
@@ -2967,7 +2966,6 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
 
     let picker = ui::file_picker(path, &cx.editor.config());
     cx.push_layer(Box::new(overlaid(picker)));
-    update_file_tree(cx);
 }
 
 fn file_picker_in_current_directory(cx: &mut Context) {
