@@ -18,6 +18,9 @@
 
 ![Screenshot](./docs/pictures/screenshot.png)
 
+Now with file tree:
+![Screenshot](./docs/pictures/image.png)
+
 A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.
 
 The editing model is very heavily based on Kakoune; during development I found
